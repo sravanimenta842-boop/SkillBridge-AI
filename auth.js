@@ -1,154 +1,77 @@
 'use strict';
-/**
- * Authentication: scrypt password hashing, DB-backed sessions (only a SHA-256
- * hash of the token is stored), cookie handling and access guards.
- */
-const crypto = require('crypto');
-const { promisify } = require('util');
-const config = require('./config');
-const db = require('./db');
-const { HttpError } = require('./http');
+const db = require('../db');
+const auth = require('../auth');
+const config = require('../config');
+const { HttpError, createLimiter } = require('../http');
+const { str, getProfile } = require('../context');
 
-const scrypt = promisify(crypto.scrypt);
-const COOKIE = 'sb_session';
-const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
+const loginLimiter = createLimiter({ windowMs: 15 * 60 * 1000, max: 8 });
+const registerLimiter = createLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-async function hashPassword(password) {
-  const salt = crypto.randomBytes(16);
-  const key = await scrypt(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p });
-  return ['scrypt', SCRYPT.N, SCRYPT.r, SCRYPT.p, salt.toString('base64'), key.toString('base64')].join('$');
+function publicUser(u) {
+  return { id: u.id, name: u.name, email: u.email, role: u.role, status: u.status };
 }
 
-async function verifyPassword(password, stored) {
-  try {
-    const [algo, N, r, p, saltB64, hashB64] = String(stored).split('$');
-    if (algo !== 'scrypt') return false;
-    const expected = Buffer.from(hashB64, 'base64');
-    const actual = await scrypt(password, Buffer.from(saltB64, 'base64'), expected.length, { N: +N, r: +r, p: +p });
-    return crypto.timingSafeEqual(actual, expected);
-  } catch { return false; }
-}
+module.exports = function (router) {
+  router.get('/api/config', () => ({
+    aiConfigured: config.aiConfigured(),
+  }));
 
-// A valid-looking hash used to keep login timing constant for unknown emails.
-let DUMMY_HASH = null;
-async function dummyVerify(password) {
-  if (!DUMMY_HASH) DUMMY_HASH = await hashPassword('dummy-password-for-timing');
-  await verifyPassword(password, DUMMY_HASH);
-}
+  router.post('/api/auth/register', async ({ req, body }) => {
+    registerLimiter.check(req.socket.remoteAddress || 'ip');
+    const b = await body();
+    const name = str(b.name, { field: 'Name', min: 2, max: 80, required: true });
+    const email = str(b.email, { field: 'Email', max: 254, required: true }).toLowerCase();
+    const password = typeof b.password === 'string' ? b.password : '';
+    if (!EMAIL_RE.test(email)) throw new HttpError(400, 'Enter a valid email address.');
+    if (password.length < 8 || password.length > 128) throw new HttpError(400, 'Password must be 8–128 characters.');
+    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) throw new HttpError(400, 'Password must include at least one letter and one number.');
+    if (db.get('SELECT id FROM users WHERE email = ?', email)) throw new HttpError(409, 'An account with this email already exists.');
 
-const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+    const hash = await auth.hashPassword(password);
+    db.tx(() => {
+      const r = db.run("INSERT INTO users (name, email, password_hash, role, status, created_at) VALUES (?,?,?,'user','pending',?)", name, email, hash, db.now());
+      db.run('INSERT INTO profiles (user_id, updated_at) VALUES (?, ?)', r.lastInsertRowid, db.now());
+    });
+    return { __status: 201, body: { message: 'Registration received. An administrator must approve your account before you can sign in.' } };
+  });
 
-function parseCookies(req) {
-  const out = {};
-  for (const part of String(req.headers.cookie || '').split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
+  async function doLogin(req, res, body, wantRole) {
+    const b = await body();
+    const email = str(b.email, { field: 'Email', max: 254, required: true }).toLowerCase();
+    const password = typeof b.password === 'string' ? b.password : '';
+    const key = `${req.socket.remoteAddress}|${email}`;
+    loginLimiter.check(key);
 
-function cookieString(value, maxAgeSec) {
-  const parts = [`${COOKIE}=${encodeURIComponent(value)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAgeSec}`];
-  if (config.cookieSecure) parts.push('Secure');
-  return parts.join('; ');
-}
+    const user = db.get('SELECT * FROM users WHERE email = ?', email);
+    if (!user) { await auth.dummyVerify(password); throw new HttpError(401, 'Invalid email or password.'); }
+    const ok = await auth.verifyPassword(password, user.password_hash);
+    if (!ok) throw new HttpError(401, 'Invalid email or password.');
 
-function createSession(req, res, userId) {
-  const token = crypto.randomBytes(32).toString('base64url');
-  const ttlSec = config.sessionTtlHours * 3600;
-  db.run(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at, ip, user_agent) VALUES (?,?,?,?,?,?)',
-    sha256(token), userId, db.now(), new Date(Date.now() + ttlSec * 1000).toISOString(),
-    req.socket.remoteAddress || null, String(req.headers['user-agent'] || '').slice(0, 200)
-  );
-  res.setHeader('Set-Cookie', cookieString(token, ttlSec));
-}
-
-function destroySession(req, res) {
-  const token = parseCookies(req)[COOKIE];
-  if (token) db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
-  res.setHeader('Set-Cookie', cookieString('', 0));
-}
-
-/** Returns the session's user row or null. */
-function currentUser(req) {
-  if (req._user !== undefined) return req._user;
-  const token = parseCookies(req)[COOKIE];
-  let user = null;
-  if (token) {
-    const row = db.get(
-      `SELECT u.id, u.name, u.email, u.role, u.status, u.created_at, s.expires_at
-         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`, sha256(token));
-    if (row) {
-      if (new Date(row.expires_at) < new Date()) {
-        db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
-      } else {
-        user = { id: row.id, name: row.name, email: row.email, role: row.role, status: row.status, createdAt: row.created_at };
-      }
+    if (wantRole === 'admin' && user.role !== 'admin') throw new HttpError(401, 'Invalid email or password.');
+    if (wantRole === 'user' && user.role === 'admin') throw new HttpError(403, 'This is an admin account. Use the Admin Login instead.');
+    if (user.status === 'pending') throw new HttpError(403, 'Your registration is still awaiting admin approval.', { code: 'pending' });
+    if (user.status === 'rejected') {
+      throw new HttpError(403, 'Your registration was not approved' + (user.reject_reason ? `: ${user.reject_reason}` : '.'), { code: 'rejected' });
     }
+    loginLimiter.reset(key);
+    auth.createSession(req, res, user.id);
+    db.run('UPDATE users SET last_login_at = ? WHERE id = ?', db.now(), user.id);
+    return { user: publicUser(user) };
   }
-  req._user = user;
-  return user;
-}
 
-/* ---------- Guards (used as route middleware) ---------- */
-function requireUser(req) {
-  const u = currentUser(req);
-  if (!u) throw new HttpError(401, 'Please sign in to continue.');
-  if (u.role !== 'user') throw new HttpError(403, 'This area is for student accounts.');
-  if (u.status !== 'approved') throw new HttpError(403, 'Your account has not been approved yet.');
-  return u;
-}
-function requireAdmin(req) {
-  const u = currentUser(req);
-  if (!u) throw new HttpError(401, 'Please sign in as admin.');
-  if (u.role !== 'admin') throw new HttpError(403, 'Admin access required.');
-  return u;
-}
+  router.post('/api/auth/login', ({ req, res, body }) => doLogin(req, res, body, 'user'));
+  router.post('/api/auth/admin/login', ({ req, res, body }) => doLogin(req, res, body, 'admin'));
 
-/** Create the admin account on first start (credentials come from the environment). */
-async function bootstrapAdmin() {
-  const existing = db.get("SELECT id, email, password_hash FROM users WHERE role = 'admin' ORDER BY id LIMIT 1");
-  if (existing) {
-    // .env is the source of truth for the admin login: if ADMIN_PASSWORD (and/or ADMIN_EMAIL) is set and
-    // differs from what is stored, update it. This makes the project portable (a copied database or a
-    // changed .env never leaves you locked out).
-    const wantEmail = (config.admin.email || existing.email).toLowerCase();
-    const pwdOk = config.admin.password ? await verifyPassword(config.admin.password, existing.password_hash) : true;
-    if (config.admin.password && (!pwdOk || wantEmail !== existing.email)) {
-      const clash = db.get('SELECT id FROM users WHERE email = ? AND id != ?', wantEmail, existing.id);
-      if (clash) { console.warn(`[admin] ADMIN_EMAIL ${wantEmail} belongs to another account – admin login unchanged.`); return; }
-      db.run("UPDATE users SET email = ?, password_hash = ?, status = 'approved' WHERE id = ?", wantEmail, await hashPassword(config.admin.password), existing.id);
-      db.run('DELETE FROM sessions WHERE user_id = ?', existing.id);
-      console.log(`[admin] Admin login synced from .env  →  ${wantEmail}`);
-    }
-    return;
-  }
-  const email = config.admin.email || 'admin@skillbridge.local';
-  let password = config.admin.password;
-  let generated = false;
-  if (!password) { password = crypto.randomBytes(9).toString('base64url'); generated = true; }
-  const hash = await hashPassword(password);
-  db.run(
-    "INSERT INTO users (name, email, password_hash, role, status, created_at, reviewed_at) VALUES (?,?,?,'admin','approved',?,?)",
-    config.admin.name, email, hash, db.now(), db.now()
-  );
-  console.log('\n──────────────────────────────────────────────');
-  console.log(' Admin account created');
-  console.log('   Email   :', email);
-  if (generated) {
-    console.log('   Password:', password, ' (shown once – save it now)');
-  } else {
-    console.log('   Password: taken from ADMIN_PASSWORD in your .env');
-  }
-  console.log('──────────────────────────────────────────────\n');
-}
+  router.post('/api/auth/logout', ({ req, res }) => {
+    auth.destroySession(req, res);
+    return { ok: true };
+  });
 
-function purgeExpiredSessions() {
-  db.run('DELETE FROM sessions WHERE expires_at < ?', db.now());
-}
-
-module.exports = {
-  hashPassword, verifyPassword, dummyVerify, createSession, destroySession, currentUser,
-  requireUser, requireAdmin, bootstrapAdmin, purgeExpiredSessions,
+  router.get('/api/auth/me', ({ req }) => {
+    const u = auth.currentUser(req);
+    if (!u) throw new HttpError(401, 'Not signed in.');
+    return { user: publicUser(u), profile: u.role === 'user' ? getProfile(u.id) : null };
+  });
 };
