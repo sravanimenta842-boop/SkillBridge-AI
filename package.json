@@ -1,0 +1,24 @@
+{
+  "name": "skillbridge-ai",
+  "version": "2.0.0",
+  "description": "AI-powered career and employment support platform: admin-approved accounts, AI skill assessment, skill-gap analysis, jobs & local job radar, resume studio, career coach.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "reset-admin": "node scripts/reset-admin.js",
+    "seed": "node scripts/seed-demo.js",
+    "test": "node tests/e2e.test.js",
+    "test:ui": "node tests/ui-smoke.js"
+  },
+  "engines": { "node": ">=22.13.0" },
+  "dependencies": {
+    "docx": "^9.5.0",
+    "pdfjs-dist": "^5.4.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "keywords": ["ai", "career", "skills", "resume", "jobs"],
+  "license": "MIT"
+}
